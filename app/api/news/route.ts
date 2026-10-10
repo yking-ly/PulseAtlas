@@ -2,6 +2,7 @@ import { env } from "cloudflare:workers";
 import { DEMO_EVENTS, type NewsEvent } from "@/lib/news-data";
 import { clusterNewsEvents } from "@/lib/news-clustering.mjs";
 import { analyzeNewsText } from "@/lib/news-nlp";
+import { cacheNewsResponse, defaultNewsCache, matchCachedNews } from "@/lib/news-response-cache.mjs";
 import { impactSearchQuery, parseNewsSearch } from "@/lib/news-search.mjs";
 import { enforceRequestLimit, rateLimitResponse } from "@/lib/request-rate-limit.mjs";
 
@@ -40,12 +41,7 @@ type LocationCandidate = {
 const WORLD_EDITIONS = ["us", "in", "gb"];
 const MAX_ARTICLES_PER_REFRESH = 80;
 const MAX_MAP_LOOKUPS_PER_REFRESH = 10;
-const NEWS_CACHE_SECONDS = 5 * 60;
 const memoryGeocodeCache = new Map<string, VerifiedLocation>();
-
-function defaultCache() {
-  return (globalThis.caches as CacheStorage & { default?: Cache } | undefined)?.default;
-}
 
 const LOCATIONS: LocationCandidate[] = [
   { pattern: /\bdelhi\b|\bnew delhi\b/i, location: "Delhi, India", country: "India", lat: 28.61, lng: 77.21 },
@@ -316,13 +312,9 @@ export async function GET(request: Request) {
     });
   }
 
-  const cache = defaultCache();
-  try {
-    const cached = await cache?.match(request);
-    if (cached) return cached;
-  } catch {
-    // A cache outage should not take live news offline.
-  }
+  const cache = defaultNewsCache();
+  const cached = await matchCachedNews(cache, request);
+  if (cached) return cached;
 
   const retryAfter = await enforceRequestLimit(env.DB, request, { scope: "news", limit: 12, windowSeconds: 5 * 60 });
   if (retryAfter) return rateLimitResponse(retryAfter, "Too many news searches. Try again in a few minutes.");
@@ -366,7 +358,7 @@ export async function GET(request: Request) {
       : normalize(results);
     const verified = await verifyLocations(normalized);
     const clustered = clusterNewsEvents(verified.events);
-    const response = Response.json({
+    return cacheNewsResponse(cache, request, Response.json({
       mode: "live",
       events: clustered.length ? clustered : DEMO_EVENTS,
       locationVerification: {
@@ -376,15 +368,7 @@ export async function GET(request: Request) {
       },
       analysis: { method: "training-free-nlp", trainingRequired: false, language: "en" },
       search,
-    }, {
-      headers: { "Cache-Control": `public, max-age=${NEWS_CACHE_SECONDS}, s-maxage=${NEWS_CACHE_SECONDS}` },
-    });
-    try {
-      await cache?.put(request, response.clone());
-    } catch {
-      // The live response remains usable when cache storage is unavailable.
-    }
-    return response;
+    }));
   } catch (error) {
     console.error("SerpApi news request failed", error);
     return Response.json({
